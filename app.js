@@ -10,6 +10,7 @@ const { createMessageHandler } = require('./lib/router');
 const { renderQrCard } = require('./lib/qr-card');
 const { ensureMediaCompatibility } = require('./lib/media-compat');
 const { createInboundPoll } = require('./lib/inbound-poll');
+const { createRecovery, closeClient, memorySnapshot } = require('./lib/browser-recovery');
 
 const ROOT = __dirname;
 const { settings, authorized, bootstrap } = require('./lib/cloud');
@@ -24,6 +25,26 @@ let selfIds = [];
 let configRevision = 0;
 let configTail = Promise.resolve();
 const state = { state: 'offline', detail: 'Preparando el bot.', qrDataUrl: null, account: null, replies: 0, lastReplyAt: null, lastError: null };
+const recovery = createRecovery({
+  restart: async () => {
+    const active = client;
+    client = null;
+    await closeClient(active);
+    if (connectPromise) await connectPromise;
+    if (!shuttingDown) await connect(true);
+  },
+  isAllowed: () => !shuttingDown && !panelOnly,
+  onSchedule: (delay, attempt) => setState('starting', `Recuperación v5: reconectando en ${delay / 1000} segundos (intento ${attempt}/5).`),
+  onLimit: () => setState('error', 'Chrome falló varias veces. Revisa los logs y pulsa Reconectar para volver a intentar.'),
+  onError: recordError
+});
+function browserFailure(active, error) {
+  if (client !== active || shuttingDown) return;
+  inboundPoll?.stop();
+  recordError(error instanceof Error ? error : new Error('Chrome se desconectó.'));
+  void memorySnapshot().then(snapshot => console.log(`Recursos al fallar Chrome: ${JSON.stringify(snapshot)}`)).catch(recordError);
+  recovery.request();
+}
 
 function setState(name, detail) {
   state.state = name;
@@ -59,7 +80,7 @@ async function connect(force = false) {
     if (client) {
       const previous = client;
       client = null;
-      await previous.destroy().catch(() => {});
+      await closeClient(previous);
     }
     selfIds = [];
     state.account = null;
@@ -73,10 +94,8 @@ async function connect(force = false) {
           console.log(`Navegador v4: aviso ${dialog.type()} cerrado para desbloquear JavaScript.`);
           void dialog.dismiss().catch(recordError);
         });
-        this.client.pupPage.on('error', () => {
-          inboundPoll?.stop();
-          setState('error', 'El navegador de WhatsApp falló. Pulsa Reconectar WhatsApp.');
-        });
+        this.client.pupPage.on('error', error => browserFailure(this.client, error));
+        this.client.pupBrowser.on('disconnected', () => browserFailure(this.client, new Error('Chrome se desconectó del bot.')));
         console.log(`Navegador v4: ${await this.client.pupBrowser.version()}`);
       }
     }
@@ -138,16 +157,15 @@ async function connect(force = false) {
         onError: recordError
       });
       setState('ready', 'WhatsApp conectado. El bot está listo para consultar.');
+      console.log('Recuperación v5 activada.');
       inboundPoll?.stop();
       inboundPoll = createInboundPoll({
         client: current, getConfig: () => config,
         isActive: () => client === current && state.state === 'ready' && !shuttingDown,
         receive, onError: error => {
-          recordError(error);
           if (error.message.startsWith('Diagnóstico v3')) {
-            inboundPoll?.stop();
-            setState('error', 'El navegador no responde. Pulsa Reconectar WhatsApp y revisa los logs.');
-          }
+            browserFailure(current, error);
+          } else recordError(error);
         },
         onSnapshot: snapshot => { if (Date.now() - lastPollLog > 60000) { lastPollLog = Date.now(); console.log(`Recepción v3: ${snapshot.loaded} mensajes cargados; ${snapshot.recent} textos recientes.`); } }
       });
@@ -277,6 +295,7 @@ async function route(req, res) {
     }
     if (pathname === '/api/connect') {
       if (panelOnly) throw new Error('El panel está en modo de prueba.');
+      recovery.reset();
       void connect(true);
       return json(res, 202, { ok: true });
     }
@@ -295,13 +314,14 @@ async function route(req, res) {
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  recovery.stop();
   inboundPoll?.stop();
   const timeout = setTimeout(() => process.exit(0), 8000);
   timeout.unref();
   if (server) server.close();
   const active = client;
   client = null;
-  if (active) await active.destroy().catch(() => {});
+  await closeClient(active);
   await fsp.unlink(path.join(ROOT, 'runtime', 'bot.pid')).catch(() => {});
   process.exit(0);
 }
