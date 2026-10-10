@@ -9,6 +9,7 @@ const { loadConfig, saveConfig, validateConfig } = require('./lib/config');
 const { createMessageHandler } = require('./lib/router');
 const { renderQrCard } = require('./lib/qr-card');
 const { ensureMediaCompatibility } = require('./lib/media-compat');
+const { createInboundPoll } = require('./lib/inbound-poll');
 
 const ROOT = __dirname;
 const { settings, authorized, bootstrap } = require('./lib/cloud');
@@ -17,6 +18,7 @@ let CONFIG_PATH = path.join(cloud.data, 'config.json');
 const TOKEN = crypto.randomBytes(32).toString('hex');
 const panelOnly = process.argv.includes('--panel-only');
 let config, dictionary, client, connectPromise, server, shuttingDown = false;
+let inboundPoll;
 let selfIds = [];
 let configRevision = 0;
 let configTail = Promise.resolve();
@@ -43,10 +45,11 @@ function browserPath() {
   return candidates.find(candidate => candidate && fs.existsSync(candidate));
 }
 
-async function connect() {
+async function connect(force = false) {
   if (connectPromise) return connectPromise;
-  if (state.state === 'ready') return;
+  if (state.state === 'ready' && !force) return;
   connectPromise = (async () => {
+    inboundPoll?.stop();
     if (client) {
       const previous = client;
       client = null;
@@ -115,24 +118,36 @@ async function connect() {
         onError: recordError
       });
       setState('ready', 'WhatsApp conectado. El bot está listo para consultar.');
+      inboundPoll?.stop();
+      inboundPoll = createInboundPoll({
+        client: current, getConfig: () => config,
+        isActive: () => client === current && state.state === 'ready' && !shuttingDown,
+        receive, onError: recordError
+      });
+      inboundPoll.start();
+      console.log('Recepción de respaldo activada (cada 5 segundos).');
     });
-    current.on('message_create', message => {
-      if (client !== current) return;
-      const meta = { type: message.type, outgoing: message.fromMe, senderKind: String(message.from).split('@')[1], recipientKind: String(message.to).split('@')[1], senderSuffix: String(message.from).split('@')[0].slice(-4), ageSeconds: Math.round(Date.now()/1000 - message.timestamp), idFields: message.id && typeof message.id === 'object' ? Object.keys(message.id) : typeof message.id };
-      if (message.type === 'chat') console.log(`[${new Date().toISOString()}] Evento de mensaje: ${JSON.stringify(meta)}`);
-      if (!handleMessage) { console.log('Mensaje pendiente de conexion lista.'); return; }
-      void handleMessage(message).then(result => { if (result?.ignored && message.type === 'chat') console.log(`[${new Date().toISOString()}] Mensaje descartado: ${result.ignored}`); }).catch(recordError);
-    });
+    async function receive(message, source = 'evento') {
+      if (client !== current || !handleMessage) return;
+      const result = await handleMessage(message);
+      if (message.type === 'chat' && !['duplicate-id', 'old-or-invalid-time', 'outgoing-message'].includes(result?.ignored)) {
+        console.log(`[${new Date().toISOString()}] Mensaje recibido por ${source}; resultado: ${result?.ignored || 'procesado'}.`);
+      }
+    }
+    current.on('message_create', message => { void receive(message).catch(recordError); });
+    current.on('message', message => { void receive(message).catch(recordError); });
     current.on('auth_failure', () => {
       if (client !== current) return;
       qrRevision++;
       handleMessage = null;
+      inboundPoll?.stop();
       setState('error', 'No se pudo vincular. Pulsa Volver a conectar para intentarlo de nuevo.');
     });
     current.on('disconnected', () => {
       if (client !== current || shuttingDown) return;
       qrRevision++;
       handleMessage = null;
+      inboundPoll?.stop();
       state.account = null;
       setState('disconnected', 'WhatsApp se desconectó. Pulsa Volver a conectar.');
     });
@@ -235,7 +250,7 @@ async function route(req, res) {
     }
     if (pathname === '/api/connect') {
       if (panelOnly) throw new Error('El panel está en modo de prueba.');
-      void connect();
+      void connect(true);
       return json(res, 202, { ok: true });
     }
     return json(res, 404, { error: 'Acción no encontrada.' });
@@ -253,6 +268,7 @@ async function route(req, res) {
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  inboundPoll?.stop();
   const timeout = setTimeout(() => process.exit(0), 8000);
   timeout.unref();
   if (server) server.close();
