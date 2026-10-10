@@ -37,6 +37,11 @@ function recordError(error) {
   console.error(`[${new Date().toISOString()}] Error del bot: ${error?.stack || state.lastError}`);
 }
 function browserPath() {
+  if (process.platform === 'linux') {
+    const compatible = require('puppeteer').executablePath();
+    if (!fs.existsSync(compatible)) throw new Error('No se instaló Chrome compatible. Despliega el Dockerfile v4 actualizado.');
+    return compatible;
+  }
   const candidates = [
     process.env.BOT_BROWSER_PATH,
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -61,11 +66,25 @@ async function connect(force = false) {
     state.lastError = null;
     setState('starting', 'Abriendo la conexión con WhatsApp.');
     const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+    class GuardedLocalAuth extends LocalAuth {
+      async afterBrowserInitialized() {
+        await super.afterBrowserInitialized();
+        this.client.pupPage.on('dialog', dialog => {
+          console.log(`Navegador v4: aviso ${dialog.type()} cerrado para desbloquear JavaScript.`);
+          void dialog.dismiss().catch(recordError);
+        });
+        this.client.pupPage.on('error', () => {
+          inboundPoll?.stop();
+          setState('error', 'El navegador de WhatsApp falló. Pulsa Reconectar WhatsApp.');
+        });
+        console.log(`Navegador v4: ${await this.client.pupBrowser.version()}`);
+      }
+    }
     const QRCode = require('qrcode');
     const executablePath = browserPath();
     if (!executablePath) throw new Error('Instala Google Chrome o Microsoft Edge para vincular WhatsApp.');
     const current = new Client({
-      authStrategy: new LocalAuth({ clientId: 'diccionario-personal', dataPath: path.join(cloud.data, '.session') }),
+      authStrategy: new GuardedLocalAuth({ clientId: 'diccionario-personal', dataPath: path.join(cloud.data, '.session') }),
       puppeteer: { headless: true, executablePath, timeout: 60000, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] },
       webVersionCache: { type: 'local', path: path.join(cloud.data, '.wwebjs_cache') },
       authTimeoutMs: 120000,
@@ -123,7 +142,13 @@ async function connect(force = false) {
       inboundPoll = createInboundPoll({
         client: current, getConfig: () => config,
         isActive: () => client === current && state.state === 'ready' && !shuttingDown,
-        receive, onError: recordError,
+        receive, onError: error => {
+          recordError(error);
+          if (error.message.startsWith('Diagnóstico v3')) {
+            inboundPoll?.stop();
+            setState('error', 'El navegador no responde. Pulsa Reconectar WhatsApp y revisa los logs.');
+          }
+        },
         onSnapshot: snapshot => { if (Date.now() - lastPollLog > 60000) { lastPollLog = Date.now(); console.log(`Recepción v3: ${snapshot.loaded} mensajes cargados; ${snapshot.recent} textos recientes.`); } }
       });
       inboundPoll.start();
