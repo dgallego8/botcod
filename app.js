@@ -19,6 +19,7 @@ const TOKEN = crypto.randomBytes(32).toString('hex');
 const panelOnly = process.argv.includes('--panel-only');
 let config, dictionary, client, connectPromise, server, shuttingDown = false;
 let inboundPoll;
+let lastPollLog = 0;
 let selfIds = [];
 let configRevision = 0;
 let configTail = Promise.resolve();
@@ -122,10 +123,11 @@ async function connect(force = false) {
       inboundPoll = createInboundPoll({
         client: current, getConfig: () => config,
         isActive: () => client === current && state.state === 'ready' && !shuttingDown,
-        receive, onError: recordError
+        receive, onError: recordError,
+        onSnapshot: snapshot => { if (Date.now() - lastPollLog > 60000) { lastPollLog = Date.now(); console.log(`Recepción v2: ${snapshot.loaded} mensajes cargados; ${snapshot.recent} textos recientes.`); } }
       });
       inboundPoll.start();
-      console.log('Recepción de respaldo activada (cada 5 segundos).');
+      console.log('Recepción de respaldo v2 activada (sin búsqueda de chats).');
     });
     async function receive(message, source = 'evento') {
       if (client !== current || !handleMessage) return;
