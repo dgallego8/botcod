@@ -124,10 +124,10 @@ async function connect(force = false) {
         client: current, getConfig: () => config,
         isActive: () => client === current && state.state === 'ready' && !shuttingDown,
         receive, onError: recordError,
-        onSnapshot: snapshot => { if (Date.now() - lastPollLog > 60000) { lastPollLog = Date.now(); console.log(`Recepción v2: ${snapshot.loaded} mensajes cargados; ${snapshot.recent} textos recientes.`); } }
+        onSnapshot: snapshot => { if (Date.now() - lastPollLog > 60000) { lastPollLog = Date.now(); console.log(`Recepción v3: ${snapshot.loaded} mensajes cargados; ${snapshot.recent} textos recientes.`); } }
       });
       inboundPoll.start();
-      console.log('Recepción de respaldo v2 activada (sin búsqueda de chats).');
+      console.log('Recepción v3 activada (diagnóstico y lectura mínima).');
     });
     async function receive(message, source = 'evento') {
       if (client !== current || !handleMessage) return;
