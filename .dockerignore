@@ -1,0 +1,9 @@
+node_modules
+.session
+.wwebjs_cache
+runtime
+.git
+test
+config.json
+*.log
+*.zip
